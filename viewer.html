@@ -11,29 +11,27 @@
       position: absolute; top: 20px; left: 20px;
       background: rgba(0,0,0,0.65); color: #fff;
       padding: 12px; border-radius: 12px;
-      width: 520px;
+      width: 640px;
     }
-    .row { display:flex; align-items:center; gap:10px; margin-top:10px; }
+    .hint { opacity: 0.85; font-size: 13px; margin-top: 4px; }
+    .trackRow { display:flex; align-items:center; gap:10px; margin-top:10px; }
+    .trackName { width: 70px; opacity: .9; font-size: 13px; }
     .grid { display:grid; grid-template-columns: repeat(16, 1fr); gap:6px; width: 100%; }
     .step {
-      height: 26px; border-radius: 6px; cursor: pointer;
+      height: 22px; border-radius: 6px; cursor: pointer;
       background: rgba(255,255,255,0.12);
       border: 1px solid rgba(255,255,255,0.18);
     }
     .step.on { background: rgba(0,255,120,0.55); border-color: rgba(0,255,120,0.9); }
-    .hint { opacity: 0.85; font-size: 13px; }
-    .small { opacity: 0.75; font-size: 12px; margin-top: 8px; }
+    .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
 <body>
 <div class="panel">
   <div id="status">Overlay geladen…</div>
-  <div class="hint">Klick: Step toggeln (noch ohne Bits)</div>
+  <div class="hint">Klick: Step toggeln (mehrere Tracks, noch ohne Bits)</div>
 
-  <div class="row">
-    <div style="width:56px; opacity:.9;">Track 1</div>
-    <div id="grid" class="grid"></div>
-  </div>
+  <div id="tracks"></div>
 
   <div class="small" id="debug"></div>
 </div>
@@ -42,50 +40,68 @@
 <script>
   const STEPS = 16;
 
-  // Pattern-State: true = Step an, false = Step aus
-  const state = new Array(STEPS).fill(false);
+  // Du kannst die Track-Namen frei ändern
+  const trackNames = ["Kick", "Snare", "Hat", "Bass"];
 
-  const gridEl = document.getElementById("grid");
+  // state[trackIndex][stepIndex] => boolean
+  const state = trackNames.map(() => new Array(STEPS).fill(false));
+
+  const tracksEl = document.getElementById("tracks");
   const statusEl = document.getElementById("status");
   const debugEl  = document.getElementById("debug");
 
-  function patternString() {
-    return state.map(x => x ? "1" : "0").join("");
+  function patternStringForTrack(t) {
+    return state[t].map(x => x ? "1" : "0").join("");
   }
 
   function render() {
-    gridEl.innerHTML = "";
+    tracksEl.innerHTML = "";
 
-    for (let i = 0; i < state.length; i++) {
-      const on = state[i];
+    for (let t = 0; t < trackNames.length; t++) {
+      const row = document.createElement("div");
+      row.className = "trackRow";
 
-      const b = document.createElement("div");
-      b.className = "step" + (on ? " on" : "");
-      b.title = `Step ${i + 1}`;
+      const name = document.createElement("div");
+      name.className = "trackName";
+      name.textContent = trackNames[t];
 
-      b.onclick = () => {
-        // HIER verändert sich state:
-        state[i] = !state[i];
+      const grid = document.createElement("div");
+      grid.className = "grid";
 
-        render();
-        debugEl.textContent = "Pattern: " + patternString();
-        // Nächster Schritt: hier senden wir später an Backend / Bits-Flow
-      };
+      for (let i = 0; i < STEPS; i++) {
+        const on = state[t][i];
+        const b = document.createElement("div");
+        b.className = "step" + (on ? " on" : "");
+        b.title = `${trackNames[t]} — Step ${i + 1}`;
 
-      gridEl.appendChild(b);
+        b.onclick = () => {
+          state[t][i] = !state[t][i];
+          render();
+          updateDebug();
+        };
+
+        grid.appendChild(b);
+      }
+
+      row.appendChild(name);
+      row.appendChild(grid);
+      tracksEl.appendChild(row);
     }
   }
 
-  // Initial render + initial debug
+  function updateDebug() {
+    const lines = [];
+    for (let t = 0; t < trackNames.length; t++) {
+      lines.push(`${trackNames[t]}: ${patternStringForTrack(t)}`);
+    }
+    debugEl.textContent = lines.join("   |   ");
+  }
+
   render();
-  debugEl.textContent = "Pattern: " + patternString();
+  updateDebug();
 
   Twitch.ext.onAuthorized((auth) => {
     statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
-  });
-
-  Twitch.ext.onVisibilityChanged((isVisible) => {
-    console.log("visibility", isVisible);
   });
 </script>
 </body>
