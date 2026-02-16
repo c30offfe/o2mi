@@ -21,70 +21,60 @@
       height: 22px; border-radius: 6px; cursor: pointer;
       background: rgba(255,255,255,0.12);
       border: 1px solid rgba(255,255,255,0.18);
+      user-select: none;
     }
     .step.on { background: rgba(0,255,120,0.55); border-color: rgba(0,255,120,0.9); }
     .step.play { outline: 2px solid rgba(255,255,255,0.9); }
+    .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
 <body>
 <div class="panel">
   <div id="status">Overlay geladen…</div>
-  <div class="hint" id="hint">Klick: Step toggeln (mehrere Tracks)</div>
-
+  <div class="hint" id="hint">Init…</div>
   <div id="tracks"></div>
-
   <div class="small" id="debug"></div>
 </div>
 
 <script src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
 <script>
   const STEPS = 16;
-
-  // Tracks
   const trackNames = ["Kick", "Snare", "Hat", "Bass"];
-
-  // state[trackIndex][stepIndex] => boolean
   const state = trackNames.map(() => new Array(STEPS).fill(false));
+
+  // ===== DEV SCHALTER =====
+  const BITS_ENABLED = true; // <- für Entwicklung auf false setzen
+  const BITS_SKU_STEP = "step_toggle_10";
+  // ========================
 
   const tracksEl = document.getElementById("tracks");
   const statusEl = document.getElementById("status");
   const hintEl   = document.getElementById("hint");
   const debugEl  = document.getElementById("debug");
 
-  // Playhead
+  // Playhead Timing
   let playStep = 0;
   const bpm = 90;
   const stepMs = (60_000 / bpm) / 4; // 16tel
 
-  // --- Bits (Schritt 5A: Frontend-Flow) ---
-  // 1) Lege in der Extension-Konsole ein Bits-Produkt mit genau dieser SKU an.
-  // 2) Dann öffnet ein Klick den Bits-Dialog, und erst nach Kauf toggeln wir den Step.
-  const BITS_SKU_STEP = "step_toggle_10";
+  // Wir bauen DOM einmal und halten Referenzen
+  const stepEls = trackNames.map(() => new Array(STEPS));
 
-  // Schalter für Debug: wenn Bits (noch) nicht konfiguriert sind, kannst du hier "true" lassen,
-  // dann toggelt ein Klick ohne Bits.
-  const ALLOW_FREE_TOGGLE_IF_BITS_NOT_READY = true;
-
-  // Wir merken uns "welcher Klick wartet gerade auf Zahlung?"
+  // Bits: wir erlauben nur 1 offenen Kauf zur Zeit (sonst wird’s chaotisch)
   // {t, i}
   let pendingToggle = null;
+  let purchaseInFlight = false;
 
   function patternStringForTrack(t) {
     return state[t].map(x => x ? "1" : "0").join("");
   }
-
   function updateDebug() {
-    const lines = [];
-    for (let t = 0; t < trackNames.length; t++) {
-      lines.push(`${trackNames[t]}: ${patternStringForTrack(t)}`);
-    }
-    debugEl.textContent = lines.join("   |   ");
+    debugEl.textContent = trackNames.map((n,t)=> `${n}: ${patternStringForTrack(t)}`).join("   |   ");
   }
 
-  function render() {
+  function buildUIOnce() {
     tracksEl.innerHTML = "";
-
     for (let t = 0; t < trackNames.length; t++) {
       const row = document.createElement("div");
       row.className = "trackRow";
@@ -97,16 +87,12 @@
       grid.className = "grid";
 
       for (let i = 0; i < STEPS; i++) {
-        const on = state[t][i];
-        const isPlay = (i === playStep);
-
         const b = document.createElement("div");
-        b.className = "step" + (on ? " on" : "") + (isPlay ? " play" : "");
+        b.className = "step";
         b.title = `${trackNames[t]} — Step ${i + 1}`;
-
-        b.onclick = () => onStepClick(t, i);
-
+        b.addEventListener("click", () => onStepClick(t, i));
         grid.appendChild(b);
+        stepEls[t][i] = b;
       }
 
       row.appendChild(name);
@@ -115,54 +101,83 @@
     }
   }
 
+  function refreshClasses() {
+    for (let t = 0; t < trackNames.length; t++) {
+      for (let i = 0; i < STEPS; i++) {
+        const el = stepEls[t][i];
+        el.classList.toggle("on", state[t][i]);
+        el.classList.toggle("play", i === playStep);
+        el.classList.toggle("pending", pendingToggle && pendingToggle.t === t && pendingToggle.i === i);
+      }
+    }
+  }
+
   function applyToggle(t, i) {
     state[t][i] = !state[t][i];
-    render();
+    refreshClasses();
     updateDebug();
   }
 
   function onStepClick(t, i) {
-    // Wenn Bits verfügbar sind -> Purchase Flow
-    if (globalThis.Twitch?.ext?.bits?.useBits) {
-      pendingToggle = { t, i };
-      hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}…`;
-      Twitch.ext.bits.useBits(BITS_SKU_STEP);
+    if (!BITS_ENABLED) {
+      hintEl.textContent = `DEV: toggled ${trackNames[t]} Step ${i+1}`;
+      applyToggle(t, i);
       return;
     }
 
-    // Fallback (wenn Bits nicht bereit)
-    if (ALLOW_FREE_TOGGLE_IF_BITS_NOT_READY) {
-      applyToggle(t, i);
-      // return;
+    // Bits-Mode
+    if (purchaseInFlight) {
+      hintEl.textContent = "Warte… (Bits-Kauf läuft bereits)";
+      return;
     }
+
+    // Bits API vorhanden?
+    if (!globalThis.Twitch?.ext?.bits?.useBits) {
+      hintEl.textContent = "Bits API nicht verfügbar (DEV?)";
+      return;
+    }
+
+    purchaseInFlight = true;
+    pendingToggle = { t, i };
+    refreshClasses();
+    hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}…`;
+
+    Twitch.ext.bits.useBits(BITS_SKU_STEP);
   }
 
-  // Bits callback: wenn Kauf durch ist, toggle den Step
-  // Achtung: Das ist der "ohne Backend"-Weg. Für echtes Production musst du serverseitig verifizieren (Schritt 5B).
+  // Bits callback: Kauf abgeschlossen
   if (globalThis.Twitch?.ext?.bits?.onTransactionComplete) {
     Twitch.ext.bits.onTransactionComplete((tx) => {
       console.log("bits tx complete", tx);
+      purchaseInFlight = false;
 
-      // sehr simple SKU-Prüfung (Client-seitig)
       const sku = tx?.product?.sku;
-      if (sku !== BITS_SKU_STEP) return;
+      if (sku !== BITS_SKU_STEP) {
+        hintEl.textContent = "Bits-Kauf abgeschlossen (anderes Produkt)";
+        pendingToggle = null;
+        refreshClasses();
+        return;
+      }
 
       if (pendingToggle) {
         applyToggle(pendingToggle.t, pendingToggle.i);
         hintEl.textContent = `Kauf OK ✅ ${trackNames[pendingToggle.t]} Step ${pendingToggle.i+1}`;
         pendingToggle = null;
+        refreshClasses();
       }
     });
   }
 
-  // Start UI
-  render();
+  // Init
+  buildUIOnce();
   updateDebug();
+  hintEl.textContent = BITS_ENABLED ? "Bits-Modus aktiv (Klick → Kaufdialog)" : "DEV-Modus: Klick toggelt direkt";
+  refreshClasses();
 
-  // Start playhead
+  // Playhead: nur Klassen updaten (kein DOM neu bauen)
   setInterval(() => {
     playStep = (playStep + 1) % STEPS;
-    render();
+    refreshClasses();
   }, stepMs);
 
   Twitch.ext.onAuthorized((auth) => {
