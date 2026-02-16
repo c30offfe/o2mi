@@ -13,6 +13,7 @@
       padding: 12px; border-radius: 12px;
       width: 640px;
     }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:10px; }
     .hint { opacity: 0.85; font-size: 13px; margin-top: 4px; }
     .trackRow { display:flex; align-items:center; gap:10px; margin-top:10px; }
     .trackName { width: 70px; opacity: .9; font-size: 13px; }
@@ -27,11 +28,28 @@
     .step.play { outline: 1px solid rgba(255,255,255,0.12); }
     .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
+
+    .btn {
+      display:none;
+      padding: 6px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.22);
+      background: rgba(255,255,255,0.10);
+      color: #fff;
+      cursor: pointer;
+      font-size: 12px;
+      user-select:none;
+      white-space: nowrap;
+    }
+    .btn.show { display:inline-block; }
   </style>
 </head>
 <body>
 <div class="panel">
-  <div id="status">Overlay geladen…</div>
+  <div class="topbar">
+    <div id="status">Overlay geladen…</div>
+    <button class="btn" id="cancelBtn" type="button">Abbrechen</button>
+  </div>
   <div class="hint" id="hint">Init…</div>
   <div id="tracks"></div>
   <div class="small" id="debug"></div>
@@ -48,23 +66,28 @@
   const BITS_SKU_STEP = "step_toggle_10";
   // ========================
 
+  // Auto-cancel wenn der User den Bits-Dialog schließt / abbricht
+  const PURCHASE_TIMEOUT_MS = 20_000;
+
   const tracksEl = document.getElementById("tracks");
   const statusEl = document.getElementById("status");
   const hintEl   = document.getElementById("hint");
   const debugEl  = document.getElementById("debug");
+  const cancelBtn = document.getElementById("cancelBtn");
 
   // Playhead Timing
   let playStep = 0;
   const bpm = 90;
   const stepMs = (60_000 / bpm) / 4; // 16tel
 
-  // Wir bauen DOM einmal und halten Referenzen
+  // DOM refs
   const stepEls = trackNames.map(() => new Array(STEPS));
 
-  // Bits: wir erlauben nur 1 offenen Kauf zur Zeit (sonst wird’s chaotisch)
+  // Bits: 1 Kauf gleichzeitig
   // {t, i}
   let pendingToggle = null;
   let purchaseInFlight = false;
+  let purchaseTimer = null;
 
   function patternStringForTrack(t) {
     return state[t].map(x => x ? "1" : "0").join("");
@@ -110,6 +133,9 @@
         el.classList.toggle("pending", pendingToggle && pendingToggle.t === t && pendingToggle.i === i);
       }
     }
+
+    // Cancel-Button nur zeigen, wenn pending ist
+    cancelBtn.classList.toggle("show", !!pendingToggle);
   }
 
   function applyToggle(t, i) {
@@ -118,6 +144,25 @@
     updateDebug();
   }
 
+  function clearPurchaseTimer() {
+    if (purchaseTimer) {
+      clearTimeout(purchaseTimer);
+      purchaseTimer = null;
+    }
+  }
+
+  function cancelPending(reason) {
+    clearPurchaseTimer();
+    purchaseInFlight = false;
+    pendingToggle = null;
+    refreshClasses();
+    hintEl.textContent = reason || "Abgebrochen.";
+  }
+
+  cancelBtn.addEventListener("click", () => {
+    cancelPending("Abgebrochen ✅ (kein Kauf durchgeführt)");
+  });
+
   function onStepClick(t, i) {
     if (!BITS_ENABLED) {
       hintEl.textContent = `DEV: toggled ${trackNames[t]} Step ${i+1}`;
@@ -125,9 +170,15 @@
       return;
     }
 
-    // Bits-Mode
-    if (purchaseInFlight) {
-      hintEl.textContent = "Warte… (Bits-Kauf läuft bereits)";
+    // Wenn bereits pending:
+    // - Klick auf denselben Step = Cancel (intuitiv)
+    // - Klick auf anderen Step = Hinweis, erst canceln oder warten
+    if (pendingToggle) {
+      if (pendingToggle.t === t && pendingToggle.i === i) {
+        cancelPending("Abgebrochen ✅ (gleicher Step erneut geklickt)");
+      } else {
+        hintEl.textContent = "Warte… oder klicke 'Abbrechen' (Bits-Kauf läuft)";
+      }
       return;
     }
 
@@ -140,7 +191,13 @@
     purchaseInFlight = true;
     pendingToggle = { t, i };
     refreshClasses();
-    hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}…`;
+    hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}… (Abbrechen möglich)`;
+
+    // Auto-cancel falls kein onTransactionComplete kommt
+    clearPurchaseTimer();
+    purchaseTimer = setTimeout(() => {
+      cancelPending("Zeit abgelaufen ⏱️ (Kauf nicht abgeschlossen)");
+    }, PURCHASE_TIMEOUT_MS);
 
     Twitch.ext.bits.useBits(BITS_SKU_STEP);
   }
@@ -149,13 +206,16 @@
   if (globalThis.Twitch?.ext?.bits?.onTransactionComplete) {
     Twitch.ext.bits.onTransactionComplete((tx) => {
       console.log("bits tx complete", tx);
+
+      // Timer + pending aufräumen, egal was passiert
+      clearPurchaseTimer();
       purchaseInFlight = false;
 
       const sku = tx?.product?.sku;
       if (sku !== BITS_SKU_STEP) {
-        hintEl.textContent = "Bits-Kauf abgeschlossen (anderes Produkt)";
         pendingToggle = null;
         refreshClasses();
+        hintEl.textContent = "Bits-Kauf abgeschlossen (anderes Produkt)";
         return;
       }
 
@@ -164,6 +224,9 @@
         hintEl.textContent = `Kauf OK ✅ ${trackNames[pendingToggle.t]} Step ${pendingToggle.i+1}`;
         pendingToggle = null;
         refreshClasses();
+      } else {
+        // Edge case: Transaction kam rein, aber wir hatten kein pending (z.B. reload)
+        hintEl.textContent = "Kauf OK ✅ (kein pending step)";
       }
     });
   }
@@ -174,7 +237,7 @@
   hintEl.textContent = BITS_ENABLED ? "Bits-Modus aktiv (Klick → Kaufdialog)" : "DEV-Modus: Klick toggelt direkt";
   refreshClasses();
 
-  // Playhead: nur Klassen updaten (kein DOM neu bauen)
+  // Playhead
   setInterval(() => {
     playStep = (playStep + 1) % STEPS;
     refreshClasses();
