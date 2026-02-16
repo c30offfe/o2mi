@@ -23,13 +23,14 @@
       border: 1px solid rgba(255,255,255,0.18);
     }
     .step.on { background: rgba(0,255,120,0.55); border-color: rgba(0,255,120,0.9); }
+    .step.play { outline: 2px solid rgba(255,255,255,0.9); }
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
 <body>
 <div class="panel">
   <div id="status">Overlay geladen…</div>
-  <div class="hint">Klick: Step toggeln (mehrere Tracks, noch ohne Bits)</div>
+  <div class="hint" id="hint">Klick: Step toggeln (mehrere Tracks)</div>
 
   <div id="tracks"></div>
 
@@ -40,7 +41,7 @@
 <script>
   const STEPS = 16;
 
-  // Du kannst die Track-Namen frei ändern
+  // Tracks
   const trackNames = ["Kick", "Snare", "Hat", "Bass"];
 
   // state[trackIndex][stepIndex] => boolean
@@ -48,10 +49,37 @@
 
   const tracksEl = document.getElementById("tracks");
   const statusEl = document.getElementById("status");
+  const hintEl   = document.getElementById("hint");
   const debugEl  = document.getElementById("debug");
+
+  // Playhead
+  let playStep = 0;
+  const bpm = 90;
+  const stepMs = (60_000 / bpm) / 4; // 16tel
+
+  // --- Bits (Schritt 5A: Frontend-Flow) ---
+  // 1) Lege in der Extension-Konsole ein Bits-Produkt mit genau dieser SKU an.
+  // 2) Dann öffnet ein Klick den Bits-Dialog, und erst nach Kauf toggeln wir den Step.
+  const BITS_SKU_STEP = "step_toggle_10";
+
+  // Schalter für Debug: wenn Bits (noch) nicht konfiguriert sind, kannst du hier "true" lassen,
+  // dann toggelt ein Klick ohne Bits.
+  const ALLOW_FREE_TOGGLE_IF_BITS_NOT_READY = true;
+
+  // Wir merken uns "welcher Klick wartet gerade auf Zahlung?"
+  // {t, i}
+  let pendingToggle = null;
 
   function patternStringForTrack(t) {
     return state[t].map(x => x ? "1" : "0").join("");
+  }
+
+  function updateDebug() {
+    const lines = [];
+    for (let t = 0; t < trackNames.length; t++) {
+      lines.push(`${trackNames[t]}: ${patternStringForTrack(t)}`);
+    }
+    debugEl.textContent = lines.join("   |   ");
   }
 
   function render() {
@@ -70,15 +98,13 @@
 
       for (let i = 0; i < STEPS; i++) {
         const on = state[t][i];
+        const isPlay = (i === playStep);
+
         const b = document.createElement("div");
-        b.className = "step" + (on ? " on" : "");
+        b.className = "step" + (on ? " on" : "") + (isPlay ? " play" : "");
         b.title = `${trackNames[t]} — Step ${i + 1}`;
 
-        b.onclick = () => {
-          state[t][i] = !state[t][i];
-          render();
-          updateDebug();
-        };
+        b.onclick = () => onStepClick(t, i);
 
         grid.appendChild(b);
       }
@@ -89,16 +115,55 @@
     }
   }
 
-  function updateDebug() {
-    const lines = [];
-    for (let t = 0; t < trackNames.length; t++) {
-      lines.push(`${trackNames[t]}: ${patternStringForTrack(t)}`);
-    }
-    debugEl.textContent = lines.join("   |   ");
+  function applyToggle(t, i) {
+    state[t][i] = !state[t][i];
+    render();
+    updateDebug();
   }
 
+  function onStepClick(t, i) {
+    // Wenn Bits verfügbar sind -> Purchase Flow
+    if (globalThis.Twitch?.ext?.bits?.useBits) {
+      pendingToggle = { t, i };
+      hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}…`;
+      Twitch.ext.bits.useBits(BITS_SKU_STEP);
+      return;
+    }
+
+    // Fallback (wenn Bits nicht bereit)
+    if (ALLOW_FREE_TOGGLE_IF_BITS_NOT_READY) {
+      applyToggle(t, i);
+      // return;
+    }
+  }
+
+  // Bits callback: wenn Kauf durch ist, toggle den Step
+  // Achtung: Das ist der "ohne Backend"-Weg. Für echtes Production musst du serverseitig verifizieren (Schritt 5B).
+  if (globalThis.Twitch?.ext?.bits?.onTransactionComplete) {
+    Twitch.ext.bits.onTransactionComplete((tx) => {
+      console.log("bits tx complete", tx);
+
+      // sehr simple SKU-Prüfung (Client-seitig)
+      const sku = tx?.product?.sku;
+      if (sku !== BITS_SKU_STEP) return;
+
+      if (pendingToggle) {
+        applyToggle(pendingToggle.t, pendingToggle.i);
+        hintEl.textContent = `Kauf OK ✅ ${trackNames[pendingToggle.t]} Step ${pendingToggle.i+1}`;
+        pendingToggle = null;
+      }
+    });
+  }
+
+  // Start UI
   render();
   updateDebug();
+
+  // Start playhead
+  setInterval(() => {
+    playStep = (playStep + 1) % STEPS;
+    render();
+  }, stepMs);
 
   Twitch.ext.onAuthorized((auth) => {
     statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
