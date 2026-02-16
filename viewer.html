@@ -13,11 +13,29 @@
       padding: 12px; border-radius: 12px;
       width: 640px;
     }
+
     .topbar { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+
     .hint { opacity: 0.85; font-size: 13px; margin-top: 4px; }
+    .hintRow { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+
+    /* Link: Platz reserviert -> kein Hüpfen */
+    .cancelLink { min-width: 90px; text-align: right; font-size: 13px; }
+    .cancelLink a {
+      color: rgba(255,255,0,0.9);      /* wie pending */
+      text-decoration: none;
+      cursor: pointer;
+      opacity: 0;                      /* standard unsichtbar */
+      pointer-events: none;            /* nicht klickbar */
+      user-select: none;
+    }
+    .cancelLink a.show { opacity: 1; pointer-events: auto; }
+    .cancelLink a:hover { text-decoration: underline; }
+
     .trackRow { display:flex; align-items:center; gap:10px; margin-top:10px; }
     .trackName { width: 70px; opacity: .9; font-size: 13px; }
     .grid { display:grid; grid-template-columns: repeat(16, 1fr); gap:6px; width: 100%; }
+
     .step {
       height: 22px; border-radius: 6px; cursor: pointer;
       background: rgba(255,255,255,0.12);
@@ -27,30 +45,21 @@
     .step.on { background: rgba(0,255,120,0.55); border-color: rgba(0,255,120,0.9); }
     .step.play { outline: 1px solid rgba(255,255,255,0.12); }
     .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
-    .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
 
-    .btn {
-      display:none;
-      padding: 6px 10px;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.22);
-      background: rgba(255,255,255,0.10);
-      color: #fff;
-      cursor: pointer;
-      font-size: 12px;
-      user-select:none;
-      white-space: nowrap;
-    }
-    .btn.show { display:inline-block; }
+    .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
 <body>
 <div class="panel">
   <div class="topbar">
     <div id="status">Overlay geladen…</div>
-    <button class="btn" id="cancelBtn" type="button">Abbrechen</button>
   </div>
-  <div class="hint" id="hint">Init…</div>
+
+  <div class="hintRow">
+    <div class="hint" id="hint">Init…</div>
+    <div class="cancelLink"><a id="cancelLink">Abbrechen</a></div>
+  </div>
+
   <div id="tracks"></div>
   <div class="small" id="debug"></div>
 </div>
@@ -73,7 +82,7 @@
   const statusEl = document.getElementById("status");
   const hintEl   = document.getElementById("hint");
   const debugEl  = document.getElementById("debug");
-  const cancelBtn = document.getElementById("cancelBtn");
+  const cancelLink = document.getElementById("cancelLink");
 
   // Playhead Timing
   let playStep = 0;
@@ -133,9 +142,7 @@
         el.classList.toggle("pending", pendingToggle && pendingToggle.t === t && pendingToggle.i === i);
       }
     }
-
-    // Cancel-Button nur zeigen, wenn pending ist
-    cancelBtn.classList.toggle("show", !!pendingToggle);
+    cancelLink.classList.toggle("show", !!pendingToggle);
   }
 
   function applyToggle(t, i) {
@@ -159,7 +166,7 @@
     hintEl.textContent = reason || "Abgebrochen.";
   }
 
-  cancelBtn.addEventListener("click", () => {
+  cancelLink.addEventListener("click", () => {
     cancelPending("Abgebrochen ✅ (kein Kauf durchgeführt)");
   });
 
@@ -172,17 +179,16 @@
 
     // Wenn bereits pending:
     // - Klick auf denselben Step = Cancel (intuitiv)
-    // - Klick auf anderen Step = Hinweis, erst canceln oder warten
+    // - Klick auf anderen Step = Hinweis
     if (pendingToggle) {
       if (pendingToggle.t === t && pendingToggle.i === i) {
-        cancelPending("Abgebrochen ✅ (gleicher Step erneut geklickt)");
+        cancelPending("Abgebrochen ✅");
       } else {
-        hintEl.textContent = "Warte… oder klicke 'Abbrechen' (Bits-Kauf läuft)";
+        hintEl.textContent = "Warte… oder klicke Abbrechen";
       }
       return;
     }
 
-    // Bits API vorhanden?
     if (!globalThis.Twitch?.ext?.bits?.useBits) {
       hintEl.textContent = "Bits API nicht verfügbar (DEV?)";
       return;
@@ -191,23 +197,20 @@
     purchaseInFlight = true;
     pendingToggle = { t, i };
     refreshClasses();
-    hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}… (Abbrechen möglich)`;
+    hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}…`;
 
-    // Auto-cancel falls kein onTransactionComplete kommt
     clearPurchaseTimer();
     purchaseTimer = setTimeout(() => {
-      cancelPending("Zeit abgelaufen ⏱️ (Kauf nicht abgeschlossen)");
+      cancelPending("Zeit abgelaufen ⏱️ – bitte Dialog schließen und Step erneut klicken");
     }, PURCHASE_TIMEOUT_MS);
 
     Twitch.ext.bits.useBits(BITS_SKU_STEP);
   }
 
-  // Bits callback: Kauf abgeschlossen
   if (globalThis.Twitch?.ext?.bits?.onTransactionComplete) {
     Twitch.ext.bits.onTransactionComplete((tx) => {
       console.log("bits tx complete", tx);
 
-      // Timer + pending aufräumen, egal was passiert
       clearPurchaseTimer();
       purchaseInFlight = false;
 
@@ -225,8 +228,7 @@
         pendingToggle = null;
         refreshClasses();
       } else {
-        // Edge case: Transaction kam rein, aber wir hatten kein pending (z.B. reload)
-        hintEl.textContent = "Kauf OK ✅ (kein pending step)";
+        hintEl.textContent = "Transaktion abgeschlossen ✅ (Zuordnung & Bits verloren) – bitte Step erneut klicken";
       }
     });
   }
