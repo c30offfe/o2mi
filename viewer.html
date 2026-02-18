@@ -245,8 +245,23 @@
     refreshClasses();
   }, stepMs);
 
+  const EBS_BASE = "https://o2mi.far-future.com";
+
   Twitch.ext.onAuthorized((auth) => {
     statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
+
+    fetch(`${EBS_BASE}/health`, { method: "GET" })
+    .then(async (r) => {
+      const text = await r.text();
+      // im Overlay anzeigen
+      statusEl.textContent = `EBS /health: ${r.status} ${r.statusText}`;
+      // in Console (damit du body siehst)
+      console.log("EBS /health response", r.status, r.statusText, text);
+    })
+    .catch((e) => {
+      statusEl.textContent = `EBS /health ERROR: ${String(e)}`;
+      console.error("EBS /health fetch failed", e);
+    });
   });
 </script>
 </body>
