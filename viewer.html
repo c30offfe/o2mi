@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -43,12 +44,13 @@
       user-select: none;
     }
     .step.on { background: rgba(0,255,120,0.55); border-color: rgba(0,255,120,0.9); }
-    .step.play { outline: 1px solid rgba(255,255,255,0.12); }
+    .step.play { outline: 1px solid rgba(255,255,255,0.18); }
     .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
 
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
   </style>
 </head>
+
 <body>
 <div class="panel">
   <div class="topbar">
@@ -64,8 +66,9 @@
   <div class="small" id="debug"></div>
 </div>
 
-<script src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
-<script>
+<script defer src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
+
+<script defer>
   const STEPS = 16;
   const trackNames = ["Kick", "Snare", "Hat", "Bass"];
   const state = trackNames.map(() => new Array(STEPS).fill(false));
@@ -101,6 +104,7 @@
   function patternStringForTrack(t) {
     return state[t].map(x => x ? "1" : "0").join("");
   }
+
   function updateDebug() {
     debugEl.textContent = trackNames.map((n,t)=> `${n}: ${patternStringForTrack(t)}`).join("   |   ");
   }
@@ -247,22 +251,29 @@
 
   const EBS_BASE = "https://o2mi.far-future.com";
 
-  Twitch.ext.onAuthorized((auth) => {
-    statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
+  // Twitch.ext.* solle erst ausgeführt werden, wenn auch wirklich sicher ist, dass das script mit den twitch-Extensions geladen ist. (defer)
+  // Prefer `globalThis` over `window`.
+  globalThis.addEventListener("DOMContentLoaded", () => {
 
-    fetch(`${EBS_BASE}/health`, { method: "GET" })
-    .then(async (r) => {
-      const text = await r.text();
-      // im Overlay anzeigen
-      statusEl.textContent = `EBS /health: ${r.status} ${r.statusText}`;
-      // in Console (damit du body siehst)
-      console.log("EBS /health response", r.status, r.statusText, text);
-    })
-    .catch((e) => {
-      statusEl.textContent = `EBS /health ERROR: ${String(e)}`;
-      console.error("EBS /health fetch failed", e);
+    Twitch.ext.onAuthorized((auth) => {
+      statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
+
+      fetch(`${EBS_BASE}/health`, { method: "GET" })
+      .then(async (r) => {
+        const text = await r.text();
+        // im Overlay anzeigen
+        statusEl.textContent = `EBS /health: ${r.status} ${r.statusText}`;
+        // in Console (damit du body siehst)
+        console.log("EBS /health response", r.status, r.statusText, text);
+      })
+      .catch((e) => {
+        statusEl.textContent = `EBS /health ERROR: ${String(e)}`;
+        console.error("EBS /health fetch failed", e);
+      });
     });
+
   });
+
 </script>
 </body>
 </html>
