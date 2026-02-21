@@ -73,6 +73,20 @@
     .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
 
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
+    .devDebugWrap {
+      margin-top: 10px;
+      display: none;
+    }
+    .devDebugWrap.show { display: block; }
+    .devDebugToggle {
+      border: 1px solid rgba(255,255,255,0.3);
+      background: rgba(255,255,255,0.12);
+      color: #cfe8ff;
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 11px;
+      cursor: pointer;
+    }
     .devDebug {
       margin-top: 10px;
       padding: 8px;
@@ -115,7 +129,10 @@
 
   <div id="tracks"></div>
   <div class="small" id="debug"></div>
-  <pre id="devDebugBox" class="devDebug"></pre>
+  <div id="devDebugWrap" class="devDebugWrap">
+    <button id="devDebugToggle" type="button" class="devDebugToggle">DEV Debug aufklappen</button>
+    <pre id="devDebugBox" class="devDebug"></pre>
+  </div>
 </div>
 
 <script defer src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
@@ -142,6 +159,8 @@
   const userIdentityLabelEl = document.getElementById("userIdentityLabel");
   const userIdentityValueEl = document.getElementById("userIdentityValue");
   const buyRowEl = document.getElementById("buyRow");
+  const devDebugWrapEl = document.getElementById("devDebugWrap");
+  const devDebugToggleEl = document.getElementById("devDebugToggle");
   const devDebugBoxEl = document.getElementById("devDebugBox");
 
   let authState = null;
@@ -154,6 +173,7 @@
   let userName = "";
   let displayName = "";
   let lastAuthSnapshot = null;
+  let devDebugOpen = false;
 
   let playStep = 0;
   const bpm = 90;
@@ -181,16 +201,25 @@
 
   function renderDevDebug() {
     if (!isDevMode) {
+      devDebugWrapEl.classList.remove("show");
+      devDebugToggleEl.textContent = "DEV Debug aufklappen";
       devDebugBoxEl.classList.remove("show");
       devDebugBoxEl.textContent = "";
       return;
     }
+    devDebugWrapEl.classList.add("show");
 
     const viewer = globalThis.Twitch?.ext?.viewer || {};
     const auth = lastAuthSnapshot || {};
+    const rawViewerId = String(viewer.id || "");
+    const rawAuthUserId = String(auth.userId || "");
+    const authUserIdNumeric = /^[0-9]{1,32}$/.test(rawAuthUserId)
+      ? rawAuthUserId
+      : (rawAuthUserId.match(/^U([0-9]{1,32})$/)?.[1] || null);
     const payload = {
       env: runtimeEnv,
       identity: {
+        apiUserId: getApiUserId() || null,
         technicalUserId: technicalUserId || null,
         userName: userName || null,
         displayName: displayName || null,
@@ -198,14 +227,16 @@
       auth: {
         channelId: auth.channelId || null,
         clientId: auth.clientId || null,
-        userId: auth.userId || null,
+        rawUserId: auth.userId || null,
+        normalizedNumericUserId: authUserIdNumeric,
         role: auth.role || null,
         opaqueUserId: auth.userId && !/^[0-9]{1,32}$/.test(String(auth.userId)) ? auth.userId : null,
         helixTokenMasked: maskToken(auth.helixToken),
         tokenMasked: maskToken(auth.token),
       },
       viewer: {
-        id: viewer.id || null,
+        rawId: viewer.id || null,
+        normalizedNumericId: /^[0-9]{1,32}$/.test(rawViewerId) ? rawViewerId : null,
         role: viewer.role || null,
         isLinked: viewer.isLinked ?? null,
         opaqueId: viewer.opaqueId || null,
@@ -214,7 +245,8 @@
     };
 
     devDebugBoxEl.textContent = `DEV DEBUG\n${JSON.stringify(payload, null, 2)}`;
-    devDebugBoxEl.classList.add("show");
+    devDebugToggleEl.textContent = devDebugOpen ? "DEV Debug zuklappen" : "DEV Debug aufklappen";
+    devDebugBoxEl.classList.toggle("show", devDebugOpen);
   }
 
   async function detectMode() {
@@ -237,6 +269,7 @@
     const broadcasterIdMatch = authUserId.match(/^U([0-9]{1,32})$/);
 
     // Use only numeric Twitch IDs as technical IDs. auth.userId can be opaque.
+    // TODO: Testen und prüfen, was hier passiert, wenn U12...34 oder nur 12...34 kommt - Code = robust?
     if (/^[0-9]{1,32}$/.test(viewerId)) {
       technicalUserId = viewerId;
     } else if (/^[0-9]{1,32}$/.test(authUserId)) {
@@ -350,6 +383,10 @@
 
   cancelLink.addEventListener("click", () => {
     cancelPending("Abgebrochen ✅");
+  });
+  devDebugToggleEl.addEventListener("click", () => {
+    devDebugOpen = !devDebugOpen;
+    renderDevDebug();
   });
 
   async function fetchBalance() {
