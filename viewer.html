@@ -32,11 +32,22 @@
     .cancelLink a.show { opacity: 1; pointer-events: auto; }
     .cancelLink a:hover { text-decoration: underline; }
 
-    .creditBar { margin-top: 10px; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+    .creditBar { margin-top: 10px; font-size: 13px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .creditValue { font-weight: 600; color: #8ef7ad; }
+    .userLabel { opacity: 0.9; }
+    .userValue { font-weight: 600; color: #9dd6ff; }
 
-    .buyRow { margin-top: 10px; display: none; gap: 6px; flex-wrap: wrap; }
-    .buyRow.show { display: flex; }
+    .buyRow {
+      margin-top: 10px;
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-height: 30px;
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .buyRow.show { visibility: visible; opacity: 1; pointer-events: auto; }
     .buyBtn {
       border: 1px solid rgba(255,255,255,0.3);
       background: rgba(255,255,255,0.12);
@@ -76,7 +87,12 @@
     <div class="cancelLink"><a id="cancelLink">Abbrechen</a></div>
   </div>
 
-  <div class="creditBar">Credits: <span id="creditValue" class="creditValue">-</span></div>
+  <div class="creditBar">
+    Credits: <span id="creditValue" class="creditValue">-</span>
+    <span>•</span>
+    <span id="userIdentityLabel" class="userLabel">User:</span>
+    <span id="userIdentityValue" class="userValue">-</span>
+  </div>
   <div id="buyRow" class="buyRow">
     <button class="buyBtn" data-sku="credits_100">1000 Bits = 100 Credits</button>
     <button class="buyBtn" data-sku="credits_250">2000 Bits = 250 Credits</button>
@@ -108,12 +124,19 @@
   const debugEl  = document.getElementById("debug");
   const cancelLink = document.getElementById("cancelLink");
   const creditValueEl = document.getElementById("creditValue");
+  const userIdentityLabelEl = document.getElementById("userIdentityLabel");
+  const userIdentityValueEl = document.getElementById("userIdentityValue");
   const buyRowEl = document.getElementById("buyRow");
 
   let authState = null;
+  let runtimeEnv = "unknown";
+  let isDevMode = false;
   let credits = 0;
   let pendingToggle = null;
   let pendingPurchaseSku = null;
+  let technicalUserId = "";
+  let userName = "";
+  let displayName = "";
 
   let playStep = 0;
   const bpm = 90;
@@ -131,6 +154,41 @@
 
   function renderCredits() {
     creditValueEl.textContent = String(credits);
+  }
+
+  async function detectMode() {
+    try {
+      const r = await fetch(`${EBS_BASE}/health`);
+      if (!r.ok) return;
+      const body = await r.json();
+      runtimeEnv = String(body.env || "unknown").toLowerCase();
+      isDevMode = runtimeEnv === "development" || runtimeEnv === "dev";
+    } catch (_) {
+      // Keep safe default (non-dev display).
+      // TODO: At least: console.log(`Exception while doing something: ${err}`);
+    }
+  }
+
+  function updateIdentityFromTwitch() {
+    const viewer = globalThis.Twitch?.ext?.viewer || {};
+    technicalUserId = authState?.userId || viewer.id || "";
+    userName = viewer.login || viewer.displayName || "";
+    displayName = viewer.displayName || "";
+  }
+
+  function renderIdentity() {
+    if (isDevMode) {
+      userIdentityLabelEl.textContent = "DEV:";
+      userIdentityValueEl.textContent = `userId=${technicalUserId || "-"} | userName=${userName || "-"}`;
+      return;
+    }
+
+    userIdentityLabelEl.textContent = "User:";
+    userIdentityValueEl.textContent = displayName || "-";
+  }
+
+  function getApiUserId() {
+    return technicalUserId || authState?.userId || "";
   }
 
   function showBuyOptions(show) {
@@ -197,9 +255,9 @@
   });
 
   async function fetchBalance() {
-    if (!authState?.channelId || !authState?.userId) return;
+    if (!authState?.channelId || !getApiUserId()) return;
 
-    const qs = new URLSearchParams({ channelId: authState.channelId, userId: authState.userId });
+    const qs = new URLSearchParams({ channelId: authState.channelId, userId: getApiUserId() });
     const r = await fetch(`${EBS_BASE}/balance?${qs.toString()}`);
     if (!r.ok) throw new Error(`/balance ${r.status}`);
     const body = await r.json();
@@ -213,7 +271,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         channelId: authState.channelId,
-        userId: authState.userId,
+        userId: getApiUserId(),
         cost: COST_PER_TOGGLE,
       }),
     });
@@ -235,7 +293,7 @@
   }
 
   async function onStepClick(t, i) {
-    if (!authState?.channelId || !authState?.userId) {
+    if (!authState?.channelId || !getApiUserId()) {
       hintEl.textContent = "Noch nicht autorisiert";
       return;
     }
@@ -270,7 +328,7 @@
     const r = await fetch(`${EBS_BASE}/purchase`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channelId: authState.channelId, userId: authState.userId, sku }),
+      body: JSON.stringify({ channelId: authState.channelId, userId: getApiUserId(), sku }),
     });
     const body = await r.json();
     if (!r.ok) {
@@ -335,6 +393,7 @@
   buildUIOnce();
   updateDebug();
   renderCredits();
+  renderIdentity();
   refreshClasses();
 
   setInterval(() => {
@@ -345,7 +404,11 @@
   globalThis.addEventListener("DOMContentLoaded", () => {
     Twitch.ext.onAuthorized(async (auth) => {
       authState = auth;
+      updateIdentityFromTwitch();
       statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
+
+      await detectMode();
+      renderIdentity();
 
       try {
         await fetchBalance();
