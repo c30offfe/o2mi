@@ -73,6 +73,20 @@
     .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
 
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
+    .devDebug {
+      margin-top: 10px;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.2);
+      background: rgba(0,0,0,0.25);
+      color: #cfe8ff;
+      font-size: 11px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-break: break-word;
+      display: none;
+    }
+    .devDebug.show { display: block; }
   </style>
 </head>
 
@@ -101,6 +115,7 @@
 
   <div id="tracks"></div>
   <div class="small" id="debug"></div>
+  <pre id="devDebugBox" class="devDebug"></pre>
 </div>
 
 <script defer src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
@@ -127,6 +142,7 @@
   const userIdentityLabelEl = document.getElementById("userIdentityLabel");
   const userIdentityValueEl = document.getElementById("userIdentityValue");
   const buyRowEl = document.getElementById("buyRow");
+  const devDebugBoxEl = document.getElementById("devDebugBox");
 
   let authState = null;
   let runtimeEnv = "unknown";
@@ -137,6 +153,7 @@
   let technicalUserId = "";
   let userName = "";
   let displayName = "";
+  let lastAuthSnapshot = null;
 
   let playStep = 0;
   const bpm = 90;
@@ -156,6 +173,50 @@
     creditValueEl.textContent = String(credits);
   }
 
+  function maskToken(v) {
+    if (!v || typeof v !== "string") return "-";
+    if (v.length <= 14) return `${v.slice(0, 4)}...`;
+    return `${v.slice(0, 8)}...${v.slice(-4)}`;
+  }
+
+  function renderDevDebug() {
+    if (!isDevMode) {
+      devDebugBoxEl.classList.remove("show");
+      devDebugBoxEl.textContent = "";
+      return;
+    }
+
+    const viewer = globalThis.Twitch?.ext?.viewer || {};
+    const auth = lastAuthSnapshot || {};
+    const payload = {
+      env: runtimeEnv,
+      identity: {
+        technicalUserId: technicalUserId || null,
+        userName: userName || null,
+        displayName: displayName || null,
+      },
+      auth: {
+        channelId: auth.channelId || null,
+        clientId: auth.clientId || null,
+        userId: auth.userId || null,
+        role: auth.role || null,
+        opaqueUserId: auth.userId && !/^[0-9]{1,32}$/.test(String(auth.userId)) ? auth.userId : null,
+        helixTokenMasked: maskToken(auth.helixToken),
+        tokenMasked: maskToken(auth.token),
+      },
+      viewer: {
+        id: viewer.id || null,
+        role: viewer.role || null,
+        isLinked: viewer.isLinked ?? null,
+        opaqueId: viewer.opaqueId || null,
+        sessionToken: viewer.sessionToken ? "[present]" : null,
+      },
+    };
+
+    devDebugBoxEl.textContent = `DEV DEBUG\n${JSON.stringify(payload, null, 2)}`;
+    devDebugBoxEl.classList.add("show");
+  }
+
   async function detectMode() {
     try {
       const r = await fetch(`${EBS_BASE}/health`);
@@ -171,24 +232,61 @@
 
   function updateIdentityFromTwitch() {
     const viewer = globalThis.Twitch?.ext?.viewer || {};
-    technicalUserId = authState?.userId || viewer.id || "";
-    userName = viewer.login || viewer.displayName || "";
-    displayName = viewer.displayName || "";
+    const viewerId = String(viewer.id || "");
+    const authUserId = String(authState?.userId || "");
+    const broadcasterIdMatch = authUserId.match(/^U([0-9]{1,32})$/);
+
+    // Use only numeric Twitch IDs as technical IDs. auth.userId can be opaque.
+    if (/^[0-9]{1,32}$/.test(viewerId)) {
+      technicalUserId = viewerId;
+    } else if (/^[0-9]{1,32}$/.test(authUserId)) {
+      technicalUserId = authUserId;
+    } else if (broadcasterIdMatch) {
+      technicalUserId = broadcasterIdMatch[1];
+    } else {
+      technicalUserId = "";
+    }
+
+    userName = "";
+    displayName = "";
+  }
+
+  async function fetchIdentityFromHelix() {
+    if (!technicalUserId || !authState?.helixToken || !authState?.clientId) return;
+
+    try {
+      const r = await fetch(`https://api.twitch.tv/helix/users?id=${encodeURIComponent(technicalUserId)}`, {
+        headers: {
+          "Client-Id": authState.clientId,
+          "Authorization": `Extension ${authState.helixToken}`,
+        },
+      });
+      if (!r.ok) return;
+      const body = await r.json();
+      const u = body?.data?.[0];
+      if (!u) return;
+      userName = u.login || "";
+      displayName = u.display_name || "";
+    } catch (_) {
+      // Ignore identity lookup errors for UI only.
+    }
   }
 
   function renderIdentity() {
     if (isDevMode) {
       userIdentityLabelEl.textContent = "DEV:";
       userIdentityValueEl.textContent = `userId=${technicalUserId || "-"} | userName=${userName || "-"}`;
+      renderDevDebug();
       return;
     }
 
     userIdentityLabelEl.textContent = "User:";
     userIdentityValueEl.textContent = displayName || "-";
+    renderDevDebug();
   }
 
   function getApiUserId() {
-    return technicalUserId || authState?.userId || "";
+    return technicalUserId || "";
   }
 
   function showBuyOptions(show) {
@@ -404,10 +502,19 @@
   globalThis.addEventListener("DOMContentLoaded", () => {
     Twitch.ext.onAuthorized(async (auth) => {
       authState = auth;
+      lastAuthSnapshot = {
+        channelId: auth.channelId,
+        clientId: auth.clientId,
+        userId: auth.userId,
+        role: auth.role,
+        helixToken: auth.helixToken,
+        token: auth.token,
+      };
       updateIdentityFromTwitch();
       statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
 
       await detectMode();
+      await fetchIdentityFromHelix();
       renderIdentity();
 
       try {
