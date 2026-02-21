@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Step Grid</title>
+  <style>
+    html, body { width:100%; height:100%; margin:0; }
+    body { background: rgba(0,0,0,0); font-family: system-ui, sans-serif; }
+    .panel {
+      position: absolute; top: 20px; left: 20px;
+      background: rgba(0,0,0,0.65); color: #fff;
+      padding: 12px; border-radius: 12px;
+      width: 640px;
+    }
+
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+
+    .hint { opacity: 0.85; font-size: 13px; margin-top: 4px; }
+    .hintRow { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+
+    /* Link: Platz reserviert -> kein Hüpfen */
+    .cancelLink { min-width: 90px; text-align: right; font-size: 13px; }
+    .cancelLink a {
+      color: rgba(255,255,0,0.9);      /* wie pending */
+      text-decoration: none;
+      cursor: pointer;
+      opacity: 0;                      /* standard unsichtbar */
+      pointer-events: none;            /* nicht klickbar */
+      user-select: none;
+    }
+    .cancelLink a.show { opacity: 1; pointer-events: auto; }
+    .cancelLink a:hover { text-decoration: underline; }
+
+    .trackRow { display:flex; align-items:center; gap:10px; margin-top:10px; }
+    .trackName { width: 70px; opacity: .9; font-size: 13px; }
+    .grid { display:grid; grid-template-columns: repeat(16, 1fr); gap:6px; width: 100%; }
+
+    .step {
+      height: 22px; border-radius: 6px; cursor: pointer;
+      background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.18);
+      user-select: none;
+    }
+    .step.on { background: rgba(0,255,120,0.55); border-color: rgba(0,255,120,0.9); }
+    .step.play { outline: 1px solid rgba(255,255,255,0.18); }
+    .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
+
+    .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
+  </style>
+</head>
+
+<body>
+<div class="panel">
+  <div class="topbar">
+    <div id="status">Overlay geladen…</div>
+  </div>
+
+  <div class="hintRow">
+    <div class="hint" id="hint">Init…</div>
+    <div class="cancelLink"><a id="cancelLink">Abbrechen</a></div>
+  </div>
+
+  <div id="tracks"></div>
+  <div class="small" id="debug"></div>
+</div>
+
+<script defer src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
+
+<script defer>
+  const STEPS = 16;
+  const trackNames = ["Kick", "Snare", "Hat", "Bass"];
+  const state = trackNames.map(() => new Array(STEPS).fill(false));
+
+  // ===== DEV SCHALTER =====
+  const BITS_ENABLED = true; // <- für Entwicklung auf false setzen
+  const BITS_SKU_STEP = "step_toggle_10";
+  // ========================
+
+  // Auto-cancel wenn der User den Bits-Dialog schließt / abbricht
+  const PURCHASE_TIMEOUT_MS = 20_000;
+
+  const tracksEl = document.getElementById("tracks");
+  const statusEl = document.getElementById("status");
+  const hintEl   = document.getElementById("hint");
+  const debugEl  = document.getElementById("debug");
+  const cancelLink = document.getElementById("cancelLink");
+
+  // Playhead Timing
+  let playStep = 0;
+  const bpm = 90;
+  const stepMs = (60_000 / bpm) / 4; // 16tel
+
+  // DOM refs
+  const stepEls = trackNames.map(() => new Array(STEPS));
+
+  // Bits: 1 Kauf gleichzeitig
+  // {t, i}
+  let pendingToggle = null;
+  let purchaseInFlight = false;
+  let purchaseTimer = null;
+
+  function patternStringForTrack(t) {
+    return state[t].map(x => x ? "1" : "0").join("");
+  }
+
+  function updateDebug() {
+    debugEl.textContent = trackNames.map((n,t)=> `${n}: ${patternStringForTrack(t)}`).join("   |   ");
+  }
+
+  function buildUIOnce() {
+    tracksEl.innerHTML = "";
+    for (let t = 0; t < trackNames.length; t++) {
+      const row = document.createElement("div");
+      row.className = "trackRow";
+
+      const name = document.createElement("div");
+      name.className = "trackName";
+      name.textContent = trackNames[t];
+
+      const grid = document.createElement("div");
+      grid.className = "grid";
+
+      for (let i = 0; i < STEPS; i++) {
+        const b = document.createElement("div");
+        b.className = "step";
+        b.title = `${trackNames[t]} — Step ${i + 1}`;
+        b.addEventListener("click", () => onStepClick(t, i));
+        grid.appendChild(b);
+        stepEls[t][i] = b;
+      }
+
+      row.appendChild(name);
+      row.appendChild(grid);
+      tracksEl.appendChild(row);
+    }
+  }
+
+  function refreshClasses() {
+    for (let t = 0; t < trackNames.length; t++) {
+      for (let i = 0; i < STEPS; i++) {
+        const el = stepEls[t][i];
+        el.classList.toggle("on", state[t][i]);
+        el.classList.toggle("play", i === playStep);
+        el.classList.toggle("pending", pendingToggle && pendingToggle.t === t && pendingToggle.i === i);
+      }
+    }
+    cancelLink.classList.toggle("show", !!pendingToggle);
+  }
+
+  function applyToggle(t, i) {
+    state[t][i] = !state[t][i];
+    refreshClasses();
+    updateDebug();
+  }
+
+  function clearPurchaseTimer() {
+    if (purchaseTimer) {
+      clearTimeout(purchaseTimer);
+      purchaseTimer = null;
+    }
+  }
+
+  function cancelPending(reason) {
+    clearPurchaseTimer();
+    purchaseInFlight = false;
+    pendingToggle = null;
+    refreshClasses();
+    hintEl.textContent = reason || "Abgebrochen.";
+  }
+
+  cancelLink.addEventListener("click", () => {
+    cancelPending("Abgebrochen ✅ (kein Kauf durchgeführt)");
+  });
+
+  function onStepClick(t, i) {
+    if (!BITS_ENABLED) {
+      hintEl.textContent = `DEV: toggled ${trackNames[t]} Step ${i+1}`;
+      applyToggle(t, i);
+      return;
+    }
+
+    // Wenn bereits pending:
+    // - Klick auf denselben Step = Cancel (intuitiv)
+    // - Klick auf anderen Step = Hinweis
+    if (pendingToggle) {
+      if (pendingToggle.t === t && pendingToggle.i === i) {
+        cancelPending("Abgebrochen ✅");
+      } else {
+        hintEl.textContent = "Warte… oder klicke Abbrechen";
+      }
+      return;
+    }
+
+    if (!globalThis.Twitch?.ext?.bits?.useBits) {
+      hintEl.textContent = "Bits API nicht verfügbar (DEV?)";
+      return;
+    }
+
+    purchaseInFlight = true;
+    pendingToggle = { t, i };
+    refreshClasses();
+    hintEl.textContent = `Bits-Kauf: ${trackNames[t]} Step ${i+1}…`;
+
+    clearPurchaseTimer();
+    purchaseTimer = setTimeout(() => {
+      cancelPending("Zeit abgelaufen ⏱️ – bitte Dialog schließen und Step erneut klicken");
+    }, PURCHASE_TIMEOUT_MS);
+
+    Twitch.ext.bits.useBits(BITS_SKU_STEP);
+  }
+
+  if (globalThis.Twitch?.ext?.bits?.onTransactionComplete) {
+    Twitch.ext.bits.onTransactionComplete((tx) => {
+      console.log("bits tx complete", tx);
+
+      clearPurchaseTimer();
+      purchaseInFlight = false;
+
+      const sku = tx?.product?.sku;
+      if (sku !== BITS_SKU_STEP) {
+        pendingToggle = null;
+        refreshClasses();
+        hintEl.textContent = "Bits-Kauf abgeschlossen (anderes Produkt)";
+        return;
+      }
+
+      if (pendingToggle) {
+        applyToggle(pendingToggle.t, pendingToggle.i);
+        hintEl.textContent = `Kauf OK ✅ ${trackNames[pendingToggle.t]} Step ${pendingToggle.i+1}`;
+        pendingToggle = null;
+        refreshClasses();
+      } else {
+        hintEl.textContent = "Transaktion abgeschlossen ✅ (Zuordnung & Bits verloren) – bitte Step erneut klicken";
+      }
+    });
+  }
+
+  // Init
+  buildUIOnce();
+  updateDebug();
+  hintEl.textContent = BITS_ENABLED ? "Bits-Modus aktiv (Klick → Kaufdialog)" : "DEV-Modus: Klick toggelt direkt";
+  refreshClasses();
+
+  // Playhead
+  setInterval(() => {
+    playStep = (playStep + 1) % STEPS;
+    refreshClasses();
+  }, stepMs);
+
+  const EBS_BASE = "https://o2mi.far-future.com";
+
+  // Twitch.ext.* solle erst ausgeführt werden, wenn auch wirklich sicher ist, dass das script mit den twitch-Extensions geladen ist. (defer)
+  // Prefer `globalThis` over `window`.
+  globalThis.addEventListener("DOMContentLoaded", () => {
+
+    Twitch.ext.onAuthorized((auth) => {
+      statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
+
+      fetch(`${EBS_BASE}/health`, { method: "GET" })
+      .then(async (r) => {
+        const text = await r.text();
+        // im Overlay anzeigen
+        statusEl.textContent = `EBS /health: ${r.status} ${r.statusText}`;
+        // in Console (damit du body siehst)
+        console.log("EBS /health response", r.status, r.statusText, text);
+      })
+      .catch((e) => {
+        statusEl.textContent = `EBS /health ERROR: ${String(e)}`;
+        console.error("EBS /health fetch failed", e);
+      });
+    });
+
+  });
+
+</script>
+</body>
+</html>
