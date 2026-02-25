@@ -73,10 +73,7 @@
     .step.pending { outline: 2px solid rgba(255,255,0,0.9); }
 
     .small { opacity: 0.75; font-size: 12px; margin-top: 10px; }
-    .devDebugWrap {
-      margin-top: 10px;
-      display: none;
-    }
+    .devDebugWrap { margin-top: 10px; display: none; }
     .devDebugWrap.show { display: block; }
     .devDebugToggle {
       border: 1px solid rgba(255,255,255,0.3);
@@ -138,11 +135,21 @@
 <script defer src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
 
 <script defer>
+  // --- Grid / Voices ---
   const STEPS = 16;
-  const trackNames = ["Kick", "Snare", "Hat", "Bass"];
-  const state = trackNames.map(() => new Array(STEPS).fill(false));
 
+  // Diese Pitches sind "Ableton-ready" (v2 voices):
+  const VOICES = [
+    { name: "Kick", pitch: 36, velocity: 110, gate: 0.20 },
+    { name: "Snare", pitch: 38, velocity:  95, gate: 0.20 },
+    { name: "Hat",  pitch: 42, velocity:  75, gate: 0.15 },
+    { name: "Bass", pitch: 48, velocity: 100, gate: 0.25 },
+  ];
+
+  // --- Backend ---
   const EBS_BASE = "https://o2mi.far-future.com";
+
+  // Credits
   const COST_PER_TOGGLE = 1;
   const CREDIT_SKUS = {
     credits_100: { bits: 1000, credits: 100 },
@@ -150,6 +157,7 @@
     credits_400: { bits: 3000, credits: 400 },
   };
 
+  // --- UI handles ---
   const tracksEl = document.getElementById("tracks");
   const statusEl = document.getElementById("status");
   const hintEl   = document.getElementById("hint");
@@ -163,40 +171,85 @@
   const devDebugToggleEl = document.getElementById("devDebugToggle");
   const devDebugBoxEl = document.getElementById("devDebugBox");
 
+  // --- Runtime state ---
   let authState = null;
   let runtimeEnv = "unknown";
   let isDevMode = false;
+
   let credits = 0;
   let pendingToggle = null;
   let pendingPurchaseSku = null;
+
   let technicalUserId = "";
   let userName = "";
   let displayName = "";
   let lastAuthSnapshot = null;
   let devDebugOpen = false;
 
+  // Authoritative state from server:
+  // we store as boolean grid for UI, but it's derived from server pattern payload
+  const state = VOICES.map(() => new Array(STEPS).fill(false));
+  let lastPattern = null; // the v2 JSON payload we got (for debug)
+  let lastRev = null;
+
+  // WS
+  let ws = null;
+  let wsConnected = false;
+  let wsReconnectTimer = null;
+
+  // Playhead (UI only)
   let playStep = 0;
   const bpm = 90;
   const stepMs = (60_000 / bpm) / 4;
 
-  const stepEls = trackNames.map(() => new Array(STEPS));
-
-  function patternStringForTrack(t) {
-    return state[t].map(x => x ? "1" : "0").join("");
-  }
-
-  function updateDebug() {
-    debugEl.textContent = trackNames.map((n,t)=> `${n}: ${patternStringForTrack(t)}`).join("   |   ");
-  }
+  // DOM cache
+  const stepEls = VOICES.map(() => new Array(STEPS));
 
   function renderCredits() {
     creditValueEl.textContent = String(credits);
+  }
+
+  function showBuyOptions(show) {
+    buyRowEl.classList.toggle("show", !!show);
   }
 
   function maskToken(v) {
     if (!v || typeof v !== "string") return "-";
     if (v.length <= 14) return `${v.slice(0, 4)}...`;
     return `${v.slice(0, 8)}...${v.slice(-4)}`;
+  }
+
+  function getApiUserId() {
+    return technicalUserId || "";
+  }
+
+  // --- Mask decode (HEX only in this overlay start; server supports HEX + b64) ---
+  // MSB-first mapping per nibble: 8,4,2,1
+  function hexMaskToBools(maskHex, steps) {
+    const m = String(maskHex || "").replace(/^"|"$/g, "");
+    const out = new Array(steps).fill(false);
+    for (let i = 0; i < steps; i++) {
+      const nibbleIndex = Math.floor(i / 4);
+      const bitIndex = i % 4;
+      const ch = m.charAt(nibbleIndex);
+      const nibble = parseInt(ch, 16);
+      if (Number.isNaN(nibble)) continue;
+      const bitMask = (8 >> bitIndex);
+      out[i] = (nibble & bitMask) !== 0;
+    }
+    return out;
+  }
+
+  function patternStringForTrack(t) {
+    return state[t].map(x => x ? "1" : "0").join("");
+  }
+
+  function updateDebug() {
+    const masks = (lastPattern?.voices || []).map(v => `${v.pitch}:${v.mask}`).join(" | ");
+    debugEl.textContent =
+        VOICES.map((v,t)=> `${v.name}: ${patternStringForTrack(t)}`).join("   |   ")
+        + (masks ? `\nmask: ${masks}` : "")
+        + (lastRev !== null ? `\nrev: ${lastRev}` : "");
   }
 
   function renderDevDebug() {
@@ -213,11 +266,13 @@
     const auth = lastAuthSnapshot || {};
     const rawViewerId = String(viewer.id || "");
     const rawAuthUserId = String(auth.userId || "");
-    const authUserIdNumeric = /^[0-9]{1,32}$/.test(rawAuthUserId)
-      ? rawAuthUserId
-      : (rawAuthUserId.match(/^U([0-9]{1,32})$/)?.[1] || null);
+    const authUserIdNumeric = /^\d{1,32}$/.test(rawAuthUserId)
+        ? rawAuthUserId
+        : (rawAuthUserId.match(/^U(\d{1,32})$/)?.[1] || null);
+
     const payload = {
       env: runtimeEnv,
+      ws: { connected: wsConnected, rev: lastRev },
       identity: {
         apiUserId: getApiUserId() || null,
         technicalUserId: technicalUserId || null,
@@ -230,18 +285,19 @@
         rawUserId: auth.userId || null,
         normalizedNumericUserId: authUserIdNumeric,
         role: auth.role || null,
-        opaqueUserId: auth.userId && !/^[0-9]{1,32}$/.test(String(auth.userId)) ? auth.userId : null,
+        opaqueUserId: auth.userId && !/^\d{1,32}$/.test(String(auth.userId)) ? auth.userId : null,
         helixTokenMasked: maskToken(auth.helixToken),
         tokenMasked: maskToken(auth.token),
       },
       viewer: {
         rawId: viewer.id || null,
-        normalizedNumericId: /^[0-9]{1,32}$/.test(rawViewerId) ? rawViewerId : null,
+        normalizedNumericId: /^\d{1,32}$/.test(rawViewerId) ? rawViewerId : null,
         role: viewer.role || null,
         isLinked: viewer.isLinked ?? null,
         opaqueId: viewer.opaqueId || null,
         sessionToken: viewer.sessionToken ? "[present]" : null,
       },
+      lastPattern: lastPattern || null,
     };
 
     devDebugBoxEl.textContent = `DEV DEBUG\n${JSON.stringify(payload, null, 2)}`;
@@ -266,13 +322,13 @@
     const viewer = globalThis.Twitch?.ext?.viewer || {};
     const viewerId = String(viewer.id || "");
     const authUserId = String(authState?.userId || "");
-    const broadcasterIdMatch = authUserId.match(/^U([0-9]{1,32})$/);
+    const broadcasterIdMatch = authUserId.match(/^U(\d{1,32})$/);
 
     // Use only numeric Twitch IDs as technical IDs. auth.userId can be opaque.
     // TODO: Testen und prüfen, was hier passiert, wenn U12...34 oder nur 12...34 kommt - Code = robust?
-    if (/^[0-9]{1,32}$/.test(viewerId)) {
+    if (/^\d{1,32}$/.test(viewerId)) {
       technicalUserId = viewerId;
-    } else if (/^[0-9]{1,32}$/.test(authUserId)) {
+    } else if (/^\d{1,32}$/.test(authUserId)) {
       technicalUserId = authUserId;
     } else if (broadcasterIdMatch) {
       technicalUserId = broadcasterIdMatch[1];
@@ -318,23 +374,15 @@
     renderDevDebug();
   }
 
-  function getApiUserId() {
-    return technicalUserId || "";
-  }
-
-  function showBuyOptions(show) {
-    buyRowEl.classList.toggle("show", !!show);
-  }
-
   function buildUIOnce() {
     tracksEl.innerHTML = "";
-    for (let t = 0; t < trackNames.length; t++) {
+    for (let t = 0; t < VOICES.length; t++) {
       const row = document.createElement("div");
       row.className = "trackRow";
 
       const name = document.createElement("div");
       name.className = "trackName";
-      name.textContent = trackNames[t];
+      name.textContent = VOICES[t].name;
 
       const grid = document.createElement("div");
       grid.className = "grid";
@@ -342,7 +390,7 @@
       for (let i = 0; i < STEPS; i++) {
         const b = document.createElement("div");
         b.className = "step";
-        b.title = `${trackNames[t]} — Step ${i + 1}`;
+        b.title = `${VOICES[t].name} — Step ${i + 1}`;
         b.addEventListener("click", () => onStepClick(t, i));
         grid.appendChild(b);
         stepEls[t][i] = b;
@@ -355,7 +403,7 @@
   }
 
   function refreshClasses() {
-    for (let t = 0; t < trackNames.length; t++) {
+    for (let t = 0; t < VOICES.length; t++) {
       for (let i = 0; i < STEPS; i++) {
         const el = stepEls[t][i];
         el.classList.toggle("on", state[t][i]);
@@ -366,32 +414,18 @@
     cancelLink.classList.toggle("show", !!pendingToggle);
   }
 
-  function applyToggle(t, i) {
-    state[t][i] = !state[t][i];
-    refreshClasses();
-    updateDebug();
-  }
-
   function cancelPending(reason) {
     pendingToggle = null;
     showBuyOptions(false);
     refreshClasses();
-    if (reason) {
-      hintEl.textContent = reason;
-    }
+    if (reason) hintEl.textContent = reason;
   }
 
-  cancelLink.addEventListener("click", () => {
-    cancelPending("Abgebrochen ✅");
-  });
-  devDebugToggleEl.addEventListener("click", () => {
-    devDebugOpen = !devDebugOpen;
-    renderDevDebug();
-  });
+  cancelLink.addEventListener("click", () => cancelPending("Abgebrochen ✅"));
+  devDebugToggleEl.addEventListener("click", () => { devDebugOpen = !devDebugOpen; renderDevDebug(); });
 
   async function fetchBalance() {
     if (!authState?.channelId || !getApiUserId()) return;
-
     const qs = new URLSearchParams({ channelId: authState.channelId, userId: getApiUserId() });
     const r = await fetch(`${EBS_BASE}/balance?${qs.toString()}`);
     if (!r.ok) throw new Error(`/balance ${r.status}`);
@@ -400,21 +434,116 @@
     renderCredits();
   }
 
-  async function consumeCredit() {
-    const r = await fetch(`${EBS_BASE}/use`, {
+  function applyPatternFromServer(pattern, rev) {
+    // pattern is v2 payload
+    lastPattern = pattern;
+    lastRev = rev ?? lastRev;
+
+    const steps = Number(pattern?.steps || STEPS);
+    // overlay is fixed 16 right now; if server sends !=16, we still display first 16 safely
+    const voices = Array.isArray(pattern?.voices) ? pattern.voices : [];
+
+    for (let t = 0; t < VOICES.length; t++) {
+      const vPitch = VOICES[t].pitch;
+      const voice = voices.find(x => Number(x.pitch) === vPitch) || voices[t];
+
+      const mask = voice?.mask || "0000";
+      const bools = hexMaskToBools(mask, STEPS); // using 16 steps start
+      for (let i = 0; i < STEPS; i++) state[t][i] = !!bools[i];
+    }
+
+    refreshClasses();
+    updateDebug();
+    renderDevDebug();
+  }
+
+  // --- WebSocket ---
+  function wsUrl() {
+    // https://... -> wss://..., http://... -> ws://...
+    if (EBS_BASE.startsWith("https://")) return "wss://" + EBS_BASE.slice("https://".length) + "/ws";
+    if (EBS_BASE.startsWith("http://")) return "ws://" + EBS_BASE.slice("http://".length) + "/ws";
+    return EBS_BASE + "/ws";
+  }
+
+  function connectWs() {
+    if (!authState?.channelId) return;
+    if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+
+    const url = wsUrl();
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      wsConnected = true;
+      statusEl.textContent = `Overlay läuft ✅ (WS verbunden) — channelId=${authState.channelId}`;
+      hintEl.textContent = "Live Sync aktiv ✅";
+      renderDevDebug();
+
+      ws.send(JSON.stringify({
+        type: "hello",
+        client: "overlay",
+        channelId: authState.channelId,
+        patternKey: "main",
+        userId: getApiUserId() || null
+      }));
+    };
+
+    ws.onclose = () => {
+      wsConnected = false;
+      renderDevDebug();
+      statusEl.textContent = `Overlay läuft ✅ (WS getrennt) — channelId=${authState.channelId}`;
+      hintEl.textContent = "Sync getrennt… reconnect…";
+      scheduleReconnect();
+    };
+
+    ws.onerror = () => {
+      // onclose handles reconnect
+    };
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(String(ev.data || "{}")); } catch (_) { return; }
+      if (!msg || typeof msg !== "object") return;
+
+      if (msg.type === "snapshot") {
+        applyPatternFromServer(msg.payload, msg.rev);
+        return;
+      }
+      if (msg.type === "pattern_update") {
+        applyPatternFromServer(msg.payload, msg.rev);
+        return;
+      }
+    };
+  }
+
+  function scheduleReconnect() {
+    if (wsReconnectTimer) return;
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null;
+      connectWs();
+    }, 1500);
+  }
+
+  // --- Toggle: server authoritative (charges credits + updates pattern) ---
+  async function toggleOnServer(t, i) {
+    const r = await fetch(`${EBS_BASE}/pattern/toggle`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         channelId: authState.channelId,
         userId: getApiUserId(),
+        voiceIndex: t,
+        stepIndex: i,
         cost: COST_PER_TOGGLE,
       }),
     });
 
-    const body = await r.json();
+    const body = await r.json().catch(() => ({}));
+
     if (r.ok) {
-      credits = Number(body.credits || 0);
+      credits = Number(body.credits || credits);
       renderCredits();
+      // Apply immediately (WS should also deliver it, but this makes UI snappy)
+      if (body.pattern) applyPatternFromServer(body.pattern, body.rev);
       return { ok: true };
     }
 
@@ -424,7 +553,7 @@
       return { ok: false, insufficient: true };
     }
 
-    throw new Error(body.error || `/use ${r.status}`);
+    throw new Error(body.error || `/pattern/toggle ${r.status}`);
   }
 
   async function onStepClick(t, i) {
@@ -432,7 +561,6 @@
       hintEl.textContent = "Noch nicht autorisiert";
       return;
     }
-
     if (pendingToggle) {
       hintEl.textContent = "Warte… oder klicke Abbrechen";
       return;
@@ -442,9 +570,8 @@
     refreshClasses();
 
     try {
-      const res = await consumeCredit();
+      const res = await toggleOnServer(t, i);
       if (res.ok) {
-        applyToggle(t, i);
         pendingToggle = null;
         refreshClasses();
         hintEl.textContent = `Step gesetzt ✅ (${credits} Credits übrig)`;
@@ -459,6 +586,7 @@
     }
   }
 
+  // Purchase stays mostly the same
   async function grantPurchasedCredits(sku) {
     const r = await fetch(`${EBS_BASE}/purchase`, {
       method: "POST",
@@ -466,9 +594,7 @@
       body: JSON.stringify({ channelId: authState.channelId, userId: getApiUserId(), sku }),
     });
     const body = await r.json();
-    if (!r.ok) {
-      throw new Error(body.error || `/purchase ${r.status}`);
-    }
+    if (!r.ok) throw new Error(body.error || `/purchase ${r.status}`);
     credits = Number(body.credits || 0);
     renderCredits();
   }
@@ -507,9 +633,8 @@
 
         if (pendingToggle) {
           const { t, i } = pendingToggle;
-          const useRes = await consumeCredit();
-          if (useRes.ok) {
-            applyToggle(t, i);
+          const res = await toggleOnServer(t, i);
+          if (res.ok) {
             pendingToggle = null;
             refreshClasses();
             hintEl.textContent = `Kauf OK ✅ + Step gesetzt (${credits} Credits übrig)`;
@@ -525,10 +650,10 @@
     });
   }
 
+  // --- Init UI ---
   buildUIOnce();
   updateDebug();
   renderCredits();
-  renderIdentity();
   refreshClasses();
 
   setInterval(() => {
@@ -536,6 +661,7 @@
     refreshClasses();
   }, stepMs);
 
+  // Twitch init
   globalThis.addEventListener("DOMContentLoaded", () => {
     Twitch.ext.onAuthorized(async (auth) => {
       authState = auth;
@@ -547,6 +673,7 @@
         helixToken: auth.helixToken,
         token: auth.token,
       };
+
       updateIdentityFromTwitch();
       statusEl.textContent = `Overlay läuft ✅ (authorized) — channelId=${auth.channelId}`;
 
@@ -560,6 +687,9 @@
       } catch (e) {
         hintEl.textContent = `Konnte Credits nicht laden: ${String(e)}`;
       }
+
+      // Connect WS last (so userId/channelId ready)
+      connectWs();
     });
   });
 </script>
