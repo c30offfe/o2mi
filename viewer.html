@@ -180,6 +180,7 @@
   let pendingToggle = null;
   let pendingPurchaseSku = null;
 
+  let apiUserId = "";
   let technicalUserId = "";
   let userName = "";
   let displayName = "";
@@ -220,7 +221,7 @@
   }
 
   function getApiUserId() {
-    return technicalUserId || "";
+    return apiUserId || "";
   }
 
   // --- Mask decode (HEX only in this overlay start; server supports HEX + b64) ---
@@ -324,8 +325,16 @@
     const authUserId = String(authState?.userId || "");
     const broadcasterIdMatch = authUserId.match(/^U(\d{1,32})$/);
 
+    // API user id can be numeric or opaque; technical id is numeric only.
+    if (authUserId) {
+      apiUserId = authUserId;
+    } else if (viewerId) {
+      apiUserId = viewerId;
+    } else {
+      apiUserId = "";
+    }
+
     // Use only numeric Twitch IDs as technical IDs. auth.userId can be opaque.
-    // TODO: Testen und prüfen, was hier passiert, wenn U12...34 oder nur 12...34 kommt - Code = robust?
     if (/^\d{1,32}$/.test(viewerId)) {
       technicalUserId = viewerId;
     } else if (/^\d{1,32}$/.test(authUserId)) {
@@ -364,7 +373,7 @@
   function renderIdentity() {
     if (isDevMode) {
       userIdentityLabelEl.textContent = "DEV:";
-      userIdentityValueEl.textContent = `userId=${technicalUserId || "-"} | userName=${userName || "-"}`;
+      userIdentityValueEl.textContent = `userId=${technicalUserId || apiUserId || "-"} | userName=${userName || "-"}`;
       renderDevDebug();
       return;
     }
